@@ -1,0 +1,296 @@
+using System.Text;
+using RimWorld.Planet;
+using UnityEngine;
+using Verse;
+
+namespace RimWorld{
+
+public enum RotStage : byte
+{
+	Fresh,
+	Rotting,
+	Dessicated,
+}
+
+public static class RottableUtility
+{
+	public static bool IsNotFresh( this Thing t )
+	{
+		var cr = t.TryGetComp<CompRottable>();
+		return cr != null && cr.Stage != RotStage.Fresh;
+	}
+
+	public static bool IsDessicated( this Thing t )
+	{
+		var cr = t.TryGetComp<CompRottable>();
+		return cr != null && cr.Stage == RotStage.Dessicated;
+	}
+
+	public static RotStage GetRotStage( this Thing t )
+    {
+		var cr = t.TryGetComp<CompRottable>();
+
+		if( cr == null )
+			return RotStage.Fresh;
+		
+		return cr.Stage;
+	}
+
+    public static RotDrawMode GetRotDrawMode(RotStage stage)
+    {
+        switch( stage )
+        {
+            case RotStage.Rotting:
+                return RotDrawMode.Rotting;
+            case RotStage.Dessicated:
+                return RotDrawMode.Dessicated;
+            case RotStage.Fresh:
+            default:
+                return RotDrawMode.Fresh;
+        }
+    }
+}
+
+
+public class CompRottable : ThingComp
+{
+	//Working vars
+	private float rotProgressInt = 0f;
+    public bool disabled;
+
+	//Properties
+	public CompProperties_Rottable PropsRot { get { return (CompProperties_Rottable)props; } }
+	public float RotProgressPct { get { return RotProgress / PropsRot.TicksToRotStart; } }
+	public float RotProgress
+	{
+		get { return rotProgressInt; }
+		set
+		{
+			var prevStage = Stage;
+
+			rotProgressInt = value;
+
+			if( prevStage != Stage )
+				StageChanged();
+		}
+	}
+	public RotStage Stage
+	{
+		get
+		{
+			if( RotProgress < PropsRot.TicksToRotStart )
+				return RotStage.Fresh;
+			else if( RotProgress < PropsRot.TicksToDessicated )
+				return RotStage.Rotting;
+			else
+				return RotStage.Dessicated;
+		}
+	}
+	public int TicksUntilRotAtCurrentTemp
+	{
+		get 
+		{
+			var cellTemp = parent.AmbientTemperature;
+			cellTemp = Mathf.RoundToInt(cellTemp); //Rounding here reduces dithering
+
+            return TicksUntilRotAtTemp(cellTemp);
+		}
+	}
+	public bool Active
+	{
+		get
+		{
+			if( PropsRot.disableIfHatcher )
+			{
+				var hatcher = parent.TryGetComp<CompHatcher>();
+				if( hatcher != null && !hatcher.TemperatureDamaged )
+					return false;
+			}
+
+			return !disabled;
+		}
+	}
+
+	public override void PostExposeData()
+	{
+		base.PostExposeData();
+
+		Scribe_Values.Look(ref rotProgressInt, "rotProg");
+        Scribe_Values.Look(ref disabled, "disabled");
+	}
+
+	public override void CompTickInterval(int delta)
+	{
+		TickInterval(delta);
+	}
+
+	public override void CompTickRare()
+	{
+		TickInterval(GenTicks.TickRareInterval);
+	}
+
+	private void TickInterval(int delta)
+	{
+		if( !Active )
+			return;
+
+        var previousProgress = RotProgress;
+
+        // Do rotting progress according to temperature
+        var cellTemp = parent.AmbientTemperature;
+        var rotRate = GenTemperature.RotRateAtTemperature(cellTemp);
+        
+		RotProgress += rotRate * delta;
+
+		//Destroy if needed
+		//Should this be in StageChanged?
+		if( Stage == RotStage.Rotting && PropsRot.rotDestroys )
+		{
+			if( parent.IsInAnyStorage() && parent.SpawnedOrAnyParentSpawned )
+			{
+				Messages.Message( "MessageRottedAwayInStorage".Translate(parent.Label, parent).CapitalizeFirst(), new TargetInfo(parent.PositionHeld, parent.MapHeld), MessageTypeDefOf.NegativeEvent);
+				LessonAutoActivator.TeachOpportunity( ConceptDefOf.SpoilageAndFreezers, OpportunityType.GoodToKnow );
+			}
+
+            //Raw meat produces rot stink when it rots away
+            if (parent.Spawned && parent.def.thingCategories.NotNullAndContains(ThingCategoryDefOf.MeatRaw))
+            {
+                var rotStinkAmt = GasUtility.RotStinkPerRawMeatRotting * parent.stackCount;
+                GasUtility.AddGas(parent.Position, parent.Map, GasType.RotStink, rotStinkAmt);
+            }
+
+			parent.Destroy();
+			return;
+		}
+
+		//Once per day...
+        var isNewDay = Mathf.FloorToInt(previousProgress / GenDate.TicksPerDay) != Mathf.FloorToInt(RotProgress / GenDate.TicksPerDay);
+		if( isNewDay && ShouldTakeRotDamage() )
+		{
+			if( Stage == RotStage.Rotting && PropsRot.rotDamagePerDay > 0 )
+				parent.TakeDamage(new DamageInfo(DamageDefOf.Rotting, GenMath.RoundRandom(PropsRot.rotDamagePerDay)));
+			else if( Stage == RotStage.Dessicated && PropsRot.dessicatedDamagePerDay > 0 )
+				parent.TakeDamage(new DamageInfo(DamageDefOf.Rotting, GenMath.RoundRandom(PropsRot.dessicatedDamagePerDay)));
+		}
+	}
+
+	private bool ShouldTakeRotDamage()
+	{
+		//We don't take dessicated damage if contained in a deterioration-preventing building like a grave or sarcophagus
+		//preventDeterioration covers dessicated damage because dessicated damage is basically a simulation of deterioration
+        if( parent.ParentHolder is Thing t && t.def.category == ThingCategory.Building && t.def.building.preventDeteriorationInside )
+			return false;
+
+		return true;
+	}
+
+	public override void PreAbsorbStack(Thing otherStack, int count)
+	{
+		//New rot progress is the weighted average of our old rot progresses
+		var proportionOther = count/ (float)(parent.stackCount + count);
+
+		var otherRotProg = ((ThingWithComps)otherStack).GetComp<CompRottable>().RotProgress;
+
+		RotProgress = Mathf.Lerp(RotProgress, otherRotProg, proportionOther);
+	}
+
+	public override void PostSplitOff(Thing piece)
+	{
+		//Piece inherits my rot progress
+		((ThingWithComps)piece).GetComp<CompRottable>().RotProgress = RotProgress;
+	}
+
+	public override void PostIngested( Pawn ingester )
+	{
+        if( Stage != RotStage.Fresh && FoodUtility.GetFoodPoisonChanceFactor(ingester) > float.Epsilon )
+			FoodUtility.AddFoodPoisoningHediff(ingester, parent, FoodPoisonCause.Rotten);
+	}
+
+	public override string CompInspectStringExtra()
+	{
+		if (!Active)
+			return null;
+        
+		var sb = new StringBuilder();
+        
+		switch(Stage)
+		{
+			case RotStage.Fresh:		sb.Append("RotStateFresh".Translate()); break;
+			case RotStage.Rotting:		sb.Append("RotStateRotting".Translate()); break;
+			case RotStage.Dessicated:	sb.Append("RotStateDessicated".Translate()); break;
+		}
+        
+		var progressUntilStartRot = PropsRot.TicksToRotStart - RotProgress;
+        if (progressUntilStartRot > 0)
+        {
+            var cellTemp = parent.AmbientTemperature;
+			cellTemp = Mathf.RoundToInt(cellTemp);//Rounding here reduces dithering
+            var rotRate = GenTemperature.RotRateAtTemperature(cellTemp);
+
+			var ticksUntilStartRot = TicksUntilRotAtCurrentTemp;
+
+            if( rotRate < 0.001f )
+            {
+                // frozen
+                sb.Append($" ({"CurrentlyFrozen".Translate()})");
+            }
+            else if( rotRate < 0.999f )
+            {
+				// refrigerated
+                sb.AppendTagged($" ({"CurrentlyRefrigerated".Translate(ticksUntilStartRot.ToStringTicksToPeriod())})");
+			}
+            else
+            {
+                // not refrigerated
+                sb.AppendTagged($" ({"NotRefrigerated".Translate(ticksUntilStartRot.ToStringTicksToPeriod())})");
+            }
+        }
+        else
+        {
+            sb.Append(".");
+        }
+		
+		return sb.ToString();
+	}
+
+    public int ApproxTicksUntilRotWhenAtTempOfTile(PlanetTile tile, int ticksAbs)
+    {
+		//Note that we ignore local map temperature offsets even if there's a map at this tile
+        var temp = GenTemperature.GetTemperatureFromSeasonAtTile(ticksAbs, tile);
+
+        return TicksUntilRotAtTemp(temp);
+    }
+
+    public int TicksUntilRotAtTemp(float temp)
+    {
+		if( !Active )
+			return GenDate.TicksPerYear * 20;
+
+        var rotRate = GenTemperature.RotRateAtTemperature(temp);
+
+        if( rotRate <= 0 )
+            return GenDate.TicksPerYear * 20; //Will never rot. Just return a huge value. Hacky
+
+        var progressUntilStartRot = PropsRot.TicksToRotStart - RotProgress;
+        if( progressUntilStartRot <= 0 )
+            return 0; //Already rotten
+
+        return Mathf.RoundToInt(progressUntilStartRot / rotRate);
+    }
+
+	private void StageChanged()
+	{
+        if( parent is Corpse corpse )
+			corpse.RotStageChanged();
+	}
+
+	public void RotImmediately(RotStage stage = RotStage.Rotting)
+	{
+		if( stage == RotStage.Rotting && RotProgress < PropsRot.TicksToRotStart )
+			RotProgress = PropsRot.TicksToRotStart;
+        else if (stage == RotStage.Dessicated && RotProgress < PropsRot.TicksToDessicated)
+            RotProgress = PropsRot.TicksToDessicated;
+    }
+}
+}
+
