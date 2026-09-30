@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<Defs>
+
+  <!-- Large impassable and non-deconstructible buildings -->
+  <ThingDef Abstract="True" Name="NonDeconstructibleAncientBuildingBase" ParentName="BuildingBase">
+    <building>
+      <deconstructible>false</deconstructible>
+      <claimable>false</claimable>
+      <displayAttackToDestroyOnInspectPane>true</displayAttackToDestroyOnInspectPane>
+    </building>
+    <passability>Impassable</passability>
+    <canOverlapZones>false</canOverlapZones>
+    <altitudeLayer>Building</altitudeLayer>
+    <statBases>
+      <Flammability>0</Flammability> <!-- Non-deconstructible things need to be non-flammable for story-logical and gameplay reasons -->
+    </statBases>
+  </ThingDef>
+
+  <ThingDef ParentName="ChunkSlagSteel">
+    <defName>ChunkMechanoidSlag</defName>
+    <label>mechanoid slag chunk</label>
+    <description>The remains of a smashed mechanoid. While useless in its current form, it can be smelted to recover steel.</description>
+    <graphicData>
+      <texPath>Things/Building/Ruins/AncientMechDetritus</texPath>
+      <graphicClass>Graphic_Random</graphicClass>
+    </graphicData>
+    <saveCompressible>false</saveCompressible>
+  </ThingDef>
+
+</Defs>
